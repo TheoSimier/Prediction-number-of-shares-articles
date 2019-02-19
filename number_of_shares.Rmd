@@ -1,0 +1,518 @@
+---
+title: "Project - Online News Popularity"
+output: html_notebook
+
+---
+```{r}
+rm(list = ls())
+```
+
+
+
+In this study, we need the following packages  
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glmnet)
+library(leaps)
+library(randomForest)
+theme_set(theme_bw())
+```
+
+
+## 1. Description of the pratical problem  
+Mashable is a global, multi-platform media and entertainment company. The following dataset summarizes a heterogeneous set of features about articles published by Mashable in a period of two years. 
+The database can be found at the folowing address: https://archive.ics.uci.edu/ml/datasets/online+news+popularity
+
+We read the data.
+```{r}
+mydata = read.csv(file = "OnlineNewsPopularity.csv", header=TRUE, sep=",", na.strings = "NA")
+head(mydata, n = 1)
+```
+
+```{r}
+dim(mydata)
+```
+Our data set is quite large. We have 39644 observations and 61 variables.
+The goal is to predict the number of shares on social networks (popularity).
+
+## 2. Description of the mathematical problem
+The problem is to explain the output that will be named "nb_shares" by the other variables of the dataset (we will exclude some of them). We denote by $Y$ the dependent variable "nb_shares" and by $X_n$ the n independent variables. We want to explain the connection between $Y$ and $X_1 ,..., X_n$.
+
+$Y$  being continuous, we are facing a regression problem. We want to find a machine that will minimize the error between one prediction of our model $y'$ and one observation $Y$. In order to measure this error, we will use the **quadratic risk function** for the machine $m$ that is $R(m) = E[(Y-m(X))^2]$ to try to find a machine $m$ such as $m_n(x) \approx m^\star(x)$.
+
+As we will see later, we will estimate these risks by splitting our dataset into a **train** dataset and **test** dataset.
+
+
+## 3. Preparation and cleaning of the data
+### Cleaning of the names of the columns
+
+* **Transform lower cases**
+```{r}
+colnames(mydata) = tolower(colnames(mydata))
+```
+
+* **Change the columns names to have more explicit names**
+```{r}
+colnames(mydata)[colnames(mydata)=="n_tokens_title"] = "nb_words_title"
+colnames(mydata)[colnames(mydata)=="n_tokens_content"] = "nb_words_content"
+colnames(mydata)[colnames(mydata)=="n_unique_tokens"] = "rate_unique_words"
+colnames(mydata)[colnames(mydata)=="n_non_stop_words"] = "rate_non_stop_words"
+colnames(mydata)[colnames(mydata)=="n_non_stop_unique_tokens"] = "rate_non_stop_unique_words"
+colnames(mydata)[colnames(mydata)=="num_hrefs"] = "nb_links"
+
+# Number of links to other articles published by Mashable
+colnames(mydata)[colnames(mydata)=="num_self_hrefs"] = "nb_links_mashable" 
+colnames(mydata)[colnames(mydata)=="num_imgs"] = "nb_images"
+colnames(mydata)[colnames(mydata)=="num_videos"] = "nb_videos"
+colnames(mydata)[colnames(mydata)=="average_token_length"] = "average_word_length"
+colnames(mydata)[colnames(mydata)=="num_keywords"] = "nb_keywords"
+colnames(mydata)[colnames(mydata)=="shares"] = "nb_shares"  # Target variable
+```
+
+
+* **Cleaning the data**  
+We have ratio superior to 1. It is not possible. We find the row where the ratio of rate_non_stop_words is maximum.
+```{r}
+index_row = which.max(mydata$rate_non_stop_words)
+mydata[index_row,]
+```
+A lot of aberrant values. We drop this row.
+```{r}
+mydata = mydata[-index_row,]
+```
+We also detect an article with 0 words. We check it.
+```{r}
+index_row = which.min(mydata$nb_words_content)
+mydata[index_row,]
+```
+This is a mistake there are words in this article. We exclude the rows without words.
+```{r}
+dim(mydata) # Before exclusion
+mydata = mydata %>% filter(nb_words_content!=0)
+dim(mydata) # After exclusion
+```
+We drop the column rate_non_stop_words with only 1 in values.
+```{r}
+mydata = mydata %>% select(-rate_non_stop_words)
+```
+
+* **NA values**  
+We check that we do not have NA values. Look at the number by column.
+```{r}
+na_columns = sapply(mydata, function(x) sum(is.na(x)))
+na_columns[na_columns>0]
+```
+We do not have any missing values.
+
+* **Creation of categorical variables**  
+0 - Create an ID by row
+```{r}
+number_rows = dim(mydata)[1]
+ID = data.frame(ID = c(1:number_rows))
+mydata = cbind(ID,mydata)
+```
+
+
+**Transforming the categorical variables to factor.**
+```{r}
+columns_weekdays = mydata %>% select(contains("weekday")) %>% colnames
+columns_channel = mydata %>% select(contains("data_channel_is")) %>% colnames
+other_columns = c("is_weekend")
+# All the columns names in one vector
+columns_to_factor = c(columns_weekdays,columns_channel,other_columns)
+# We change them to factor.
+mydata[columns_to_factor] = lapply(mydata[columns_to_factor], factor)
+```
+
+* **Group the days and the channel in two variables.**   
+We have 7 categorical variables: weekday_is_monday and so on. 
+We create a new categorical variable "weekday" with the name of the day.
+
+```{r}
+df_weekday = mydata %>% select(ID, columns_weekdays) %>% gather(key=weekday, value=value_to_filter, -ID)
+df_weekday = df_weekday %>% mutate(weekday=recode(weekday,
+                                                                         "weekday_is_monday"="monday",
+                                                                         "weekday_is_tuesday"="tuesday",
+                                                                         "weekday_is_wednesday"="wednesday",
+                                                                         "weekday_is_thursday"="thursday",
+                                                                         "weekday_is_friday"="friday",
+                                                                         "weekday_is_saturday"="saturday",
+                                                                         "weekday_is_sunday"="sunday"
+                                                                         ))
+df_weekday = df_weekday %>% filter(value_to_filter==1)
+df_weekday$weekday = as.factor(df_weekday$weekday)
+df_weekday$weekday = ordered(df_weekday$weekday, levels=c("monday","tuesday","wednesday","thursday","friday","saturday","sunday"))
+df_weekday = df_weekday %>% select(ID, weekday)
+mydata = left_join(mydata, df_weekday,by="ID")
+```
+
+We have 6 categorical variables: data_channel_is_lifestyle and so on. 
+We create a new categorical variable "data_channel" with the name of the channel.
+```{r}
+df_channel = mydata %>% select(ID, columns_channel) %>% gather(key=channel, value=value_to_filter, -ID)
+df_channel = df_channel %>% mutate(channel=recode(channel,
+                                                                         "data_channel_is_lifestyle"="lifestyle",
+                                                                         "data_channel_is_entertainment"="entertainment",
+                                                                         "data_channel_is_bus"="bus",
+                                                                         "data_channel_is_socmed"="socmed",
+                                                                         "data_channel_is_tech"="tech",
+                                                                         "data_channel_is_world"="world"
+                                                                         ))
+df_channel = df_channel %>% filter(value_to_filter==1)
+df_channel$channel = as.factor(df_channel$channel)
+levels(df_channel$channel) = c(levels(df_channel$channel),"other")
+df_channel = df_channel %>% select(ID, channel)
+mydata = left_join(mydata, df_channel,by="ID")
+mydata$channel[is.na(mydata$channel)] = "other"
+```
+
+* **Removal of non predictive variables**  
+We move the target variable to first position after the non predictive variables.
+```{r}
+mydata = mydata %>% select(url, ID, timedelta, nb_shares, everything())
+```
+
+To create the models, we create a data.frame "mydata2" without the doublons and the non predictive variables.
+```{r}
+mydata2 = mydata %>% select(-c(columns_channel, columns_weekdays,url, ID, timedelta))
+```
+
+
+## 4. Description of the dataset (with dplyr)
+
+```{r}
+summary(mydata2)
+```
+```{r}
+colnames(mydata2)
+```
+
+Columns numeric
+```{r}
+columns_numeric <- unlist(lapply(mydata2, is.numeric))  
+```
+
+
+* **We follow our intuition and look at some correlations that could be interesting**
+```{r}
+cor(mydata2[,c("nb_shares","nb_words_title","nb_words_content","nb_images","nb_videos")])
+```
+The correlations are lower that we expected ! Having a lot of content in an article does not make it always popular.
+
+* **Overview - Main features of an article **
+```{r}
+mydata2%>%select(Length.title=nb_words_title,Nb_Links=nb_links,Subjectivity=global_subjectivity,Positive=max_positive_polarity,Content=nb_words_content)%>%summarise_all(funs(mean))
+```
+
+
+* **Does adding multimedia content have an impact of number of shares?**
+
+```{r}
+mydata2%>%select(nb_images,nb_videos,nb_shares)%>%mutate(multimedia_content=nb_images+nb_videos)%>%group_by(multimedia_content)%>%summarise(mean_shares=mean(nb_shares))%>%arrange(desc(mean_shares))%>%filter(mean_shares<10000)%>%head()
+```
+Articles with the higher shares mean were article with lots of multimedia content (excluding articles considered as outliers with more than 10 000 shares).
+
+
+* **Does an article with a subjective title drive more shares?**
+```{r}
+subjectivity=mydata2%>%select("nb_shares","title_subjectivity")%>%filter(nb_shares<20000)
+subjectivity$title_subjectivity=as.factor(as.numeric(subjectivity$title_subjectivity>0.75))
+
+subjectivity%>%select(title_subjectivity,nb_shares)%>%group_by(title_subjectivity)%>%summarise(Shares=mean(nb_shares))%>%arrange(desc(Shares))
+
+```
+
+An article with subjectivity in its title tends to drive slightly more shares in average.
+
+## 5. Vizualization of the dataset (with ggplot)
+
+* **How the number of shares is distributed?**
+```{r}
+ggplot(mydata2) + aes(x=nb_shares) + geom_density(fill="darkblue") + xlim(0,20000)+xlab("Number of shares")+ylab("Density")+ labs(title = "Shares Density", subtitle = "Excluding articles with more than 20000 shares") +
+  theme(plot.title = element_text(hjust = 0.5,face="bold"),plot.subtitle = element_text(hjust = 0.5))
+```
+We observe that most of the articles have a number of shares less than 5000. 
+
+
+
+* **Which weekday drive more shares?**
+```{r}
+ggplot(mydata2) + aes(x=weekday, y=nb_shares) + geom_boxplot() + ylim(0, 10000)+xlab("Weekdays")+ylab("Number of Shares")+ labs(title = "Which day drive more shares?", subtitle = "Excluding articles with more than 10000 shares") +
+  theme(plot.title = element_text(hjust = 0.5,face="bold"),plot.subtitle = element_text(hjust = 0.5))
+```
+We can observe that Saturday and Sunday drive more shares in average than the other weekdays. 
+
+* **Which channel drive more shares?**
+```{r}
+ggplot(mydata2) + aes(x=channel, y=nb_shares) + geom_boxplot() + ylim(0, 10000)+xlab("Channel")+ylab("Number of Shares")+ labs(title = "Which channel drive more shares?", subtitle = "Excluding articles with more than 10000 shares") +
+  theme(plot.title = element_text(hjust = 0.5,face="bold"),plot.subtitle = element_text(hjust = 0.5))
+```
+The above boxplots show that lifestyle, socmed, tech and other are the four channels that drive in average more shares as we have seen in the description of data.
+
+* **Comparison between weekday & Channel**
+```{r}
+ggplot(mydata2) + aes(x=weekday,fill=channel)+ geom_bar(position = "stack")+scale_fill_brewer(palette = "Blues")+xlab("Weekdays")+ylab("Frequency")+ labs(title = "Overview by day - Frequency of article posted", subtitle = "Detailed by channel") +
+  theme(plot.title = element_text(hjust = 0.5,face="bold"),plot.subtitle = element_text(hjust = 0.5))
+```
+We mentionned before that during weekend, articles that are posted drive more shares. Even though, we notice that there is less articles posted compared to other weekdays.
+
+
+* **Is there a link between shares and word content?**  
+To do this plot we select a sub-sample.
+```{r}
+
+mydata2_temp = sample_n(tbl = mydata2, size = 1000)
+ggplot(mydata2_temp) + aes(x=nb_words_content,y=nb_shares)+ geom_point(color="darkblue") +
+  geom_smooth(method="lm") +
+  ylim(0,50000)+ylab("Number of shares")+xlab("Number of words in the article") + 
+  labs(title = "Is there a link between shares and word content?", subtitle = "Excluding articles with more than 50000 shares") +
+  theme(plot.title = element_text(hjust = 0.5,face="bold"),plot.subtitle = element_text(hjust = 0.5))
+```
+The above graph suggests that the linear relation is week. 
+However we can see that most of the very shared articles do not have a lot of words.
+
+
+## 6. Machine Learning Methods
+
+We propose to use the following methods to predict the number of shares:  
+**1 - Linear model**  
+**2 - Penalized Regression (Lasso and Ridge)**  
+**3 - Random Forest**  
+
+
+
+We create a copy of that dataset that will be used for models
+```{r}
+data <- mydata2
+```
+
+
+### Additional preliminary cleaning
+There are linear dependencies in the data that will prevent us from running some models :  
+rate_positive_words + rate_negative_words = 1
+```{r}
+data %>% mutate(word_feeling = rate_positive_words + rate_negative_words) %>% ggplot() + aes(x = word_feeling) + geom_density() + ylab("Density")+xlab("Number of words in the articles") + 
+  labs(title = "Density of the sum of the variable word_feeling") +  theme(plot.title = element_text(hjust = 0.5,face="bold"))
+```
+lda_00 + lda_01 + lda_02 + lda_03 + lda_04 = 1
+```{r}
+data %>% mutate(sum_lda = lda_00 + lda_01 + lda_02 + lda_03 + lda_04) %>% ggplot() + aes(x = sum_lda) + geom_density() + ylab("Density")+xlab("Number of words in the articles") + 
+  labs(title = "Density of the sum of the variable word_feeling") +  theme(plot.title = element_text(hjust = 0.5,face="bold"))
+summary(data$lda_00 + data$lda_01 + data$lda_02 + data$lda_03 + data$lda_04)
+```
+In absciss, we have values of 1 due to error approximation in the sum. If we had truncated the values, it would have been only a peak at 1.  
+We exclude the two problematic variables.
+```{r}
+data <- data %>% select(-c(lda_04,rate_negative_words))
+```
+
+
+### Linear Model
+
+We will try to predict the number of shares based on all other regressors
+We start naively by trying to fit a Linear Regression to the whole dataset
+```{r}
+# model.lm <- lm(nb_shares~.,data=data)
+# Error: cannot allocate vector of size 11.0 Gb
+```
+
+R cannot compute it, due to the excess of parameters
+We will therefore : 
+- work only on a sample of the dataset
+- consider numerical values only
+```{r}
+Name_numeric_colums <- rownames(data.frame(columns_numeric[columns_numeric]))
+
+Name_numeric_colums <- Name_numeric_colums[Name_numeric_colums != "lda_04" & Name_numeric_colums != "rate_negative_words"]
+  
+set.seed(123456)
+data <- data %>% sample_n(10000) %>% select(Name_numeric_colums)
+```
+
+We can now separate in training and testing datasets
+```{r}
+data.train <- data %>% slice(1:8000)
+data.test <- data %>% slice(8001:10000)
+```
+
+We can now run a naive prediction model (that predicts the sample mean of the target column in the train data) and a linear model
+```{r}
+pred.naive <- rep(mean(data.train$nb_shares),nrow(data.test))
+model.lm <- lm(nb_shares~.,data=data.train)
+```
+
+We do a subset selection. We select the **BIC** criteria rather than the **AIC** criteria because it penalises more aggressively the large models. Indeed, compared to **AIC**, **BIC** increases by $log(n)d$ whereas **AIC** increases by $2d$. For n = 10000, we will have  $log(n)d \approx9.21$ which is superior to $2$ of the **AIC**.
+
+```{r}
+reg.fit.forward <- regsubsets(nb_shares~.,data=data.train,method="forward",nvmax=150)
+reg.fit.backward <- regsubsets(nb_shares~.,data=data.train,method="backward",nvmax=150)
+
+sum.reg.fit.f <- summary(reg.fit.forward)
+sum.reg.fit.b <- summary(reg.fit.backward)
+
+nb.bic.f <- order(sum.reg.fit.f$bic)[1]
+nb.bic.b <- order(sum.reg.fit.b$bic)[1]
+
+get.formula<- function(a,number){
+var.sel <- a$which[number,][-1]
+var.sel1 <- names(var.sel)[var.sel] %>% paste(collapse="+")
+form <- formula(paste("nb_shares~",var.sel1,sep=""))
+str_form <- paste("nb_shares~",var.sel1,sep="")
+str_form
+}
+
+plot(reg.fit.forward,scale="bic",main="Forward BIC")
+plot(reg.fit.backward,scale="bic",main="Backward BIC ")
+
+subset.models <- data.frame(Criteria=rep(c("Bic"),each=2),Method=c("Forward","Backward"),Formula = c(get.formula(sum.reg.fit.f,nb.bic.f),get.formula(sum.reg.fit.b,nb.bic.b)))
+
+subset.models
+```
+We see that the variables selected with the forward or backward approaches are approximately the same.  
+**For the forward approch, the BIC criteria selects the model:**
+$Y = \beta_0 + nb.links*\beta_{nb.links}+kw.max.max*\beta_{kw.max.max}+kw.min.avg*\beta_{kw.min.avg}$  
+$+kw.max.avg*\beta_{kw.max.avg}+kw.avg.avg*\beta_{kw.avg.avg}+self.reference.max.shares*\beta_{self.reference.max.shares}+lda.03*\beta_{lda.03}$
+
+
+
+We evaluate those models based on the RMSE
+```{r}
+RMSE.list <- c()
+RMSE.list <- append(RMSE.list, mean((pred.naive-data.test$nb_shares)^2)^(1/2))
+RMSE.list <- append(RMSE.list, mean((predict(model.lm, newdata=data.test)-data.test$nb_shares)^2)^(1/2))
+
+for (formula in subset.models$Formula) {
+  model.sub <- lm(formula,data=data.train) 
+  pred <- predict(model.sub, newdata = data.test) 
+  RMSE <- mean((pred-data.test$nb_shares)^2)^(1/2) 
+  RMSE.list <- append(RMSE.list,RMSE) 
+  } 
+
+RMSE.comparison <- data.frame(Criteria="mean",Method="Naive",Formula="Y") 
+RMSE.comparison <- rbind(RMSE.comparison,data.frame(Criteria="LM",Method="LM",Formula="Y"),subset.models) 
+RMSE.comparison <- RMSE.comparison %>% select(Criteria,Method) %>% mutate(RMSE=RMSE.list) 
+
+RMSE.comparison
+```
+
+### Penalized regression
+```{r}
+data.glmnet <- model.matrix(nb_shares~.,data=data.train)
+
+model.ridge <- glmnet(data.glmnet,data.train$nb_shares,alpha=0)
+model.lasso <- glmnet(data.glmnet,data.train$nb_shares,alpha=1)
+
+plot(model.ridge)
+plot(model.lasso)
+```
+We can observe the regularization path for Lasso and Ridge Regression. For Lasso, some $\beta=0$ for small $t$.
+
+
+```{r}
+ridgeCV <- cv.glmnet(data.glmnet,data.train$nb_shares,lambda=exp(seq(-20,80,length=300)),alpha=0)
+plot(ridgeCV)
+```
+
+```{r}
+lassoCV <- cv.glmnet(data.glmnet,data.train$nb_shares,lambda=exp(seq(-10,20,length=300)),alpha=1)
+plot(lassoCV)
+```
+
+We look at the 2 best models
+```{r}
+model.ridge <- glmnet(data.glmnet,data.train$nb_shares,lambda=ridgeCV$lambda.min,alpha=0)
+model.lasso <- glmnet(data.glmnet,data.train$nb_shares,lambda=lassoCV$lambda.min,alpha=1)
+
+RMSE.ridge <- mean((predict(model.ridge, newx=model.matrix(nb_shares~.,data=data.test))-data.test$nb_shares)^2)^(1/2)
+RMSE.lasso <- mean((predict(model.lasso, newx=model.matrix(nb_shares~.,data=data.test))-data.test$nb_shares)^2)^(1/2)
+
+RMSE.penalized <- data.frame(Criteria=paste("Lambda = ",ridgeCV$lambda.min),Method="Ridge",RMSE=RMSE.ridge)
+RMSE.penalized <- rbind(RMSE.penalized, data.frame(Criteria=paste("Lambda = ",lassoCV$lambda.min),Method="Lasso",RMSE=RMSE.lasso))
+
+RMSE.comparison <- rbind(RMSE.comparison, RMSE.penalized)
+RMSE.comparison
+```
+
+### Random Forests
+We reduce the number and size of tree to make it compute in a timely manner
+```{r}
+model.rf <- randomForest(nb_shares~.,data=data.train,nodesize=30,ntree=300)
+model.rf
+```
+
+```{r}
+RMSE.rf <- mean((predict(model.rf, newdata=data.test)-data.test$nb_shares)^2)^(1/2)
+RMSE.comparison <- rbind(RMSE.comparison, data.frame(Criteria="Node size = 30, ntree = 300",Method="RF",RMSE=RMSE.rf))
+RMSE.comparison
+```
+
+We increase parameters to get a more accurate prediction
+```{r}
+model.rf2 <- randomForest(nb_shares~.,data=data.train,nodesize=1,ntree=400)
+
+RMSE.rf <- mean((predict(model.rf2, newdata=data.test)-data.test$nb_shares)^2)^(1/2)
+RMSE.comparison <- rbind(RMSE.comparison, data.frame(Criteria="Node size = 1, ntree = 400",Method="RF",RMSE=RMSE.rf))
+RMSE.comparison
+```
+It doesn't improve the prediction, quite the contrary
+
+## 7. Performances of each models
+Based on our table of comparison of RMSE for each models, Lasso is the best performing model
+```{r}
+pred <- predict(model.lasso, newx=model.matrix(nb_shares~.,data=data.test))
+obs <- data.test$nb_shares
+res <- obs-pred
+
+Prediction <- data.frame(pred, obs,res)
+colnames(Prediction) <- c("pred","obs","res")
+
+Prediction %>% ggplot() + aes(x=res) + geom_density()
+```
+Our model is quite optimistic (peak before 0 in residual's distribution), but still misses the few viral articles that get shared a lot. These are the ones that have a major impact on the poor RMSE score
+
+```{r}
+Prediction <- Prediction %>% mutate(ratio = res/obs)
+Prediction %>% ggplot() + aes(x=ratio) + geom_density()
+```
+
+```{r}
+Prediction %>% ggplot() + aes(x=pred, y=obs, color=res) + geom_point()
+```
+We can see very few articles reach more than 12500 shares.
+They get very poor predictions as the model never predicts more than 11000 shares, and have a significant impact on the overall RMSE
+
+```{r}
+Pred.trim <- Prediction[Prediction$obs < 12500,]
+Pred.trim %>% ggplot() + aes(x=pred, y=obs, color=res) + geom_point()
+```
+
+```{r}
+mean(Pred.trim$res^2)^(1/2)
+```
+**If we had only observations with less than 12500 shares in the test data, the RMSE could have had been halfed.**
+If on top of that we would not have viral articles in the train data, the RMSE would have been improved.
+However, because our goal was to predict the number of shares for all articles (including the ones with more than 12500 shares), we did not exclude popular articles from the database.
+
+
+## 8. Conclusion
+The popularity of an article depends on many characteristics: day of publication, length, channel, content… Using these characteristics as predictors, we have tried to predict the number of shares on social networks (popularity). Throughout analysis and modelling, we realise that there isn’t a stable and standard recipe that will determine with a strong accuracy the popularity of an article. 
+Our models can give an idea of the success but as Mashable has published articles making major buzz (more than 20 000 shares each; maximum reached with 840k shares), this twists our models and makes them more optimistic that they should be.
+
+**Furthermore, we could have transformed the regression problem in a classification problem, for example $nb.shares>12000$, that could have allow to create more robust model to predict whether an article would turn viral (meaning number of shares superior to 12000) or not. This model could potentially be combined afterwards with two different models dedicated to predicting number of shares for viral and for non-viral articles exclusively.** 
+
+To finish, we can keep in mind that the classification model is a lead to empower authors in defining what factors could be more impactfull to result in more engagement and virality.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
