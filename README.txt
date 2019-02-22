@@ -1,6 +1,6 @@
-Project: Prediction of the number of shares of articles on social networks.
+Project: Prediction for an article of the number of shares on social networks.
 
-The goal of this project was to predict the number of shares of articles on social networks. It was inspired by the paper mentioned below.
+The goal of this project was to predict for a given article, the number of shares on social networks. It was inspired by the paper mentioned below.
 However, we decided to stay with a regression problem rather than switching to a classification problem as it was the case in the paper.
 
 Authors: Charles-Louis Kick, Laura Degioanni, Théo Simier
